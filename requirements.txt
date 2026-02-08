@@ -1,0 +1,4 @@
+requests>=2.28.0
+
+# Optional: AI-powered decision making (works with Grok, OpenAI, Ollama, etc.)
+# openai>=1.0.0
