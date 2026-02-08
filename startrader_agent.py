@@ -161,29 +161,64 @@ class StarTraderAgent:
     # Match Lifecycle
     # ================================================================
 
-    def wait_for_match(self, timeout=300):
-        """Poll until we're assigned to a match."""
-        print(f"[*] Waiting for match assignment (timeout: {timeout}s)...")
+    def wait_for_match(self, timeout=600):
+        """Join matchmaking queue and wait for a match to start."""
+        print(f"[*] Joining matchmaking queue...")
         start = time.time()
 
-        while time.time() - start < timeout:
-            resp = self.session.get(f"{self.server}/api/arena/match/session")
-            data = resp.json()
+        # Step 1: Join the queue
+        resp = self.session.post(f"{self.server}/api/arena/queue/join")
+        data = resp.json()
 
-            if data.get('success'):
-                self.match_id = data.get('match_id')
-                print(f"[+] Assigned to match {self.match_id}")
+        if data.get('success'):
+            pos = data.get('position', '?')
+            est = data.get('estimated_wait', '?')
+            print(f"[+] Queued at position {pos} (est. wait: {est}s)")
+            print(f"    A match will auto-start when ready.")
+        elif 'Already in queue' in data.get('error', ''):
+            print(f"[*] Already in queue at position {data.get('position', '?')}")
+        elif 'Already in an active match' in data.get('error', ''):
+            print(f"[+] Already in a match!")
+            return True
+        else:
+            print(f"[!] Queue join failed: {data.get('error', 'Unknown')}")
+            return False
+
+        # Step 2: Poll queue status until matched
+        last_pos = None
+        while time.time() - start < timeout:
+            resp = self.session.get(f"{self.server}/api/arena/queue/status")
+            status = resp.json()
+
+            if status.get('status') == 'matched':
+                self.match_id = status.get('match_id')
+                print(f"[+] Match found! ID: {self.match_id}")
                 return True
 
-            # Check if match is running but we're not in it
-            state_resp = self.session.get(f"{self.server}/api/arena/match/state")
-            state = state_resp.json()
-            if state.get('is_running'):
-                print(f"    Match running but we're not in it. Turn {state.get('current_turn', '?')}/{state.get('max_turns', '?')}")
-            else:
-                print("    No match running yet...")
+            if status.get('status') == 'queued':
+                pos = status.get('position', '?')
+                total = status.get('total_in_queue', '?')
+                running = status.get('match_running', False)
+                if pos != last_pos:
+                    if running:
+                        print(f"    Queue position {pos}/{total} (match in progress, waiting...)")
+                    else:
+                        print(f"    Queue position {pos}/{total} (match starting soon...)")
+                    last_pos = pos
 
-            time.sleep(10)
+            elif status.get('status') == 'not_queued':
+                # Check if we got into a match via /match/session
+                session_resp = self.session.get(f"{self.server}/api/arena/match/session")
+                session_data = session_resp.json()
+                if session_data.get('success'):
+                    self.match_id = session_data.get('match_id')
+                    print(f"[+] Match found via session! ID: {self.match_id}")
+                    return True
+                # Re-queue
+                print("    Dropped from queue, rejoining...")
+                self.session.post(f"{self.server}/api/arena/queue/join")
+
+            time.sleep(5)
 
         print("[!] Timeout waiting for match")
         return False
@@ -489,12 +524,10 @@ Strategy tips:
         print(f"\n[*] Agent ready: {self.agent_name} ({self.agent_id})")
         print(f"[*] Profile: {self.server}/arena-profile.html?id={self.agent_id}")
 
-        # Wait for match assignment
+        # Join queue and wait for match
         if not self.wait_for_match(timeout=600):
-            print("[!] No match assigned. Try starting one:")
-            print(f'    curl -X POST {self.server}/api/arena/match/start \\')
-            print(f'      -H "Content-Type: application/json" \\')
-            print(f'      -d \'{{"real_agents": ["{self.agent_id}"]}}\'')
+            print("[!] No match started in time. The server may be busy.")
+            print("[*] Try running the agent again — it will rejoin the queue.")
             return
 
         # Join match (activate game session)
