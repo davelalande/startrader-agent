@@ -48,6 +48,8 @@ class StarTraderAgent:
         self.ai_client = None
         self.visited_sectors = set()
         self.known_prices = {}  # sector -> {commodity: price}
+        self.refuel_sectors = set()  # sectors where can_refuel is True
+        self.sector_connections = {}  # sector -> [connected sector ids]
 
         if use_ai:
             self._init_ai()
@@ -259,38 +261,45 @@ class StarTraderAgent:
             return None
         return resp.json().get('player')
 
+    def _safe_json(self, resp):
+        """Safely parse JSON response, return error dict on failure."""
+        try:
+            return resp.json()
+        except Exception:
+            return {'success': False, 'error': f'Non-JSON response (HTTP {resp.status_code})'}
+
     def move_to(self, sector_id):
         """Move to an adjacent sector."""
         resp = self.session.post(f"{self.server}/api/startrader/nav/move",
                                  json={'sector_id': sector_id})
-        return resp.json()
+        return self._safe_json(resp)
 
     def scan(self):
         """Scan nearby sectors."""
-        resp = self.session.post(f"{self.server}/api/startrader/nav/scan")
-        return resp.json()
+        resp = self.session.post(f"{self.server}/api/startrader/nav/scan", json={})
+        return self._safe_json(resp)
 
     def refuel(self):
         """Refuel at current sector."""
-        resp = self.session.post(f"{self.server}/api/startrader/nav/refuel")
-        return resp.json()
+        resp = self.session.post(f"{self.server}/api/startrader/nav/refuel", json={})
+        return self._safe_json(resp)
 
     def get_market(self):
         """Get market data for current sector."""
         resp = self.session.get(f"{self.server}/api/startrader/trade/market")
-        return resp.json()
+        return self._safe_json(resp)
 
     def buy(self, commodity, quantity):
         """Buy a commodity."""
         resp = self.session.post(f"{self.server}/api/startrader/trade/buy",
                                  json={'commodity': commodity, 'quantity': quantity})
-        return resp.json()
+        return self._safe_json(resp)
 
     def sell(self, commodity, quantity):
         """Sell a commodity."""
         resp = self.session.post(f"{self.server}/api/startrader/trade/sell",
                                  json={'commodity': commodity, 'quantity': quantity})
-        return resp.json()
+        return self._safe_json(resp)
 
     # ================================================================
     # Strategy
@@ -302,8 +311,21 @@ class StarTraderAgent:
             return self._play_turn_ai(state)
         return self._play_turn_heuristic(state)
 
+    def _try_move(self, sector_id):
+        """Attempt a move and return (success, description)."""
+        result = self.move_to(sector_id)
+        if result.get('error'):
+            return False, result.get('error', 'move failed')
+        # Move succeeded — update our sector tracking from the response
+        new_player = result.get('player', {})
+        if new_player.get('current_sector'):
+            self.visited_sectors.add(new_player['current_sector'])
+        else:
+            self.visited_sectors.add(sector_id)
+        return True, None
+
     def _play_turn_heuristic(self, state):
-        """Simple heuristic strategy: explore, trade, repair."""
+        """Explore-first strategy: move to new sectors, trade along the way, stay healthy."""
         player = state.get('player', {})
         sector = state.get('sector_info', {})
         hull = player.get('hull', 100)
@@ -312,70 +334,96 @@ class StarTraderAgent:
         current_sector = player.get('current_sector', 1)
         connections = sector.get('connections', [])
         inventory = player.get('inventory', {})
+        can_refuel = sector.get('can_refuel', False)
 
         self.visited_sectors.add(current_sector)
+        self.sector_connections[current_sector] = connections
+        if can_refuel:
+            self.refuel_sectors.add(current_sector)
 
-        # Priority 1: Repair if hull is low and sector has refueling
-        if hull < 50 and sector.get('can_refuel'):
+        # Priority 1: Emergency repair (hull critical)
+        if hull < 40 and can_refuel:
             result = self.refuel()
-            if result.get('success', True):
-                return f"Refueled at Sector {current_sector} (hull was {hull})"
+            if result.get('success', False):
+                return f"Emergency repair at Sector {current_sector} (hull: {hull:.0f})"
 
-        # Priority 2: Refuel if fuel is low
-        if fuel < 20 and sector.get('can_refuel'):
+        # Priority 2: ALWAYS try to refuel when fuel is below 80
+        # (Fuel is precious — 100 max, 5 per move = 20 moves. Never pass up a station!)
+        if fuel < 80:
             result = self.refuel()
-            if result.get('success', True):
-                return f"Refueled at Sector {current_sector} (fuel was {fuel})"
+            if result.get('success'):
+                new_fuel = result.get('fuel', '?')
+                cost = result.get('cost', 0)
+                return f"Refueled at Sector {current_sector} (was {fuel:.0f}, now {new_fuel}, cost {cost:.0f}cr)"
 
-        # Priority 3: Sell inventory if we have cargo
+        # Priority 2b: If fuel is getting low, head toward a known refuel sector
+        if fuel <= 25 and not can_refuel and connections:
+            refuel_neighbor = [s for s in connections if s in self.refuel_sectors]
+            if refuel_neighbor:
+                target = refuel_neighbor[0]
+                ok, err = self._try_move(target)
+                if ok:
+                    return f"Heading to refuel at Sector {target} (fuel: {fuel:.0f})"
+            elif fuel > 0:
+                unvisited = [s for s in connections if s not in self.visited_sectors]
+                if unvisited:
+                    target = random.choice(unvisited)
+                    ok, err = self._try_move(target)
+                    if ok:
+                        return f"Fuel low ({fuel:.0f}), exploring Sector {target} for fuel"
+            if fuel <= 0:
+                return f"Stranded at Sector {current_sector} with no fuel"
+
+        # Priority 3: Sell cargo — but only if we're in a DIFFERENT sector than where we bought
         if inventory:
-            market = self.get_market()
-            if market.get('success'):
-                market_data = market.get('market', {})
+            bought_sector = getattr(self, '_bought_in_sector', None)
+            if bought_sector != current_sector:
+                market = self.get_market()
+                market_data = market.get('market', {}) if market.get('success') else {}
                 commodities = market_data.get('commodities', {})
                 for item_name, item_data in inventory.items():
                     qty = item_data.get('quantity', 0)
-                    buy_price = item_data.get('purchase_price', 0)
-                    if item_name in commodities:
+                    if qty > 0 and item_name in commodities:
                         sell_price = commodities[item_name].get('sell_price', 0)
-                        # Sell if profitable or if hull is low (liquidate)
-                        if sell_price > buy_price or hull < 40:
-                            result = self.sell(item_name, qty)
-                            profit = (sell_price - buy_price) * qty
-                            return f"Sold {qty}x {item_name} (profit: {profit:.0f})"
+                        result = self.sell(item_name, qty)
+                        total = sell_price * qty
+                        return f"Sold {qty}x {item_name} for {total:.0f}cr in Sector {current_sector}"
 
-        # Priority 4: Buy cheap commodities if we have credits and cargo space
-        if credits > 1000 and not inventory:
-            market = self.get_market()
-            if market.get('success'):
-                market_data = market.get('market', {})
-                commodities = market_data.get('commodities', {})
-                # Find cheapest commodity
-                best = None
-                best_price = float('inf')
-                for name, info in commodities.items():
-                    price = info.get('buy_price', float('inf'))
-                    if price < best_price and price > 0:
-                        best = name
-                        best_price = price
-                if best and best_price < credits * 0.5:
-                    qty = min(int(credits * 0.4 / best_price), 20)
-                    if qty > 0:
-                        # Remember price for this sector
-                        self.known_prices[current_sector] = {best: best_price}
-                        result = self.buy(best, qty)
-                        return f"Bought {qty}x {best} at {best_price}/ea in Sector {current_sector}"
-
-        # Priority 5: Explore - prefer unvisited sectors
+        # Priority 4: Explore — this is our main action (exploration = score)
         if connections:
             unvisited = [s for s in connections if s not in self.visited_sectors]
             if unvisited:
                 target = random.choice(unvisited)
-            else:
-                target = random.choice(connections)
-            result = self.move_to(target)
-            prefix = "Explored" if target not in self.visited_sectors else "Moved to"
-            return f"{prefix} Sector {target}"
+                ok, err = self._try_move(target)
+                if ok:
+                    return f"Explored Sector {target}"
+                return f"Explore to {target} failed: {err}"
+
+        # Priority 5: Buy cargo to sell in the next sector (only if no inventory)
+        if not inventory and credits > 500:
+            market = self.get_market()
+            market_data = market.get('market', {}) if market.get('success') else {}
+            commodities = market_data.get('commodities', {})
+            if commodities:
+                # Buy the cheapest commodity to carry to next sector
+                best = min(commodities.items(), key=lambda x: x[1].get('buy_price', 9999))
+                name, info = best
+                price = info.get('buy_price', 9999)
+                if price > 0 and price < credits * 0.6:
+                    qty = min(int(credits * 0.4 / price), 20)
+                    if qty > 0:
+                        result = self.buy(name, qty)
+                        self._bought_in_sector = current_sector
+                        self.known_prices[current_sector] = {name: price}
+                        return f"Bought {qty}x {name} at {price:.0f}/ea (will sell in next sector)"
+
+        # Priority 6: Move to any connected sector (all explored, just keep moving)
+        if connections:
+            target = random.choice(connections)
+            ok, err = self._try_move(target)
+            if ok:
+                return f"Moved to Sector {target}"
+            return f"Move to {target} failed: {err}"
 
         return "No action available"
 
@@ -433,9 +481,10 @@ Strategy tips:
             action = json.loads(action_text.strip())
 
             if action['action'] == 'move':
-                result = self.move_to(action['sector_id'])
-                self.visited_sectors.add(action['sector_id'])
-                return f"AI: Move to Sector {action['sector_id']}"
+                ok, err = self._try_move(action['sector_id'])
+                if ok:
+                    return f"AI: Move to Sector {action['sector_id']}"
+                return f"AI: Move to {action['sector_id']} failed: {err}"
             elif action['action'] == 'buy':
                 result = self.buy(action['commodity'], action['quantity'])
                 return f"AI: Buy {action['quantity']}x {action['commodity']}"
@@ -483,7 +532,10 @@ Strategy tips:
                 break
 
             # Check if match is still running
-            match_state = self.session.get(f"{self.server}/api/arena/match/state").json()
+            try:
+                match_state = self.session.get(f"{self.server}/api/arena/match/state").json()
+            except Exception:
+                match_state = {}
             if not match_state.get('is_running'):
                 print(f"\n[*] Match ended after {turn} turns.")
                 # Print final standings
@@ -498,11 +550,15 @@ Strategy tips:
                 break
 
             # Play a turn
-            action = self.play_turn(state)
+            try:
+                action = self.play_turn(state)
+            except Exception as e:
+                action = f"Error: {e}"
             turn += 1
             sector = player.get('current_sector', '?')
+            fuel = player.get('fuel', 0)
             print(f"  Turn {turn:3d} | Sector {sector:3} | "
-                  f"Hull {hull:5.0f} | Credits {player.get('credits', 0):8.0f} | {action}")
+                  f"Hull {hull:5.0f} | Fuel {fuel:5.0f} | Credits {player.get('credits', 0):8.0f} | {action}")
 
             # Wait for game speed (match the coordinator's turn timing)
             time.sleep(3)
