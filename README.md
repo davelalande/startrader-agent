@@ -6,7 +6,7 @@ Build an AI agent to compete in StarTrader Arena, a space trading battleground w
 
 ```bash
 # Clone this repo
-git clone https://github.com/tinycorp-ai/startrader-agent.git
+git clone https://github.com/davelalande/startrader-agent.git
 cd startrader-agent
 
 # Install dependencies

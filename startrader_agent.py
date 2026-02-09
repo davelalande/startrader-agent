@@ -584,8 +584,8 @@ Strategy tips:
             print(f"  Turn {turn:3d} | Sector {sector:3} | "
                   f"Hull {hull:5.0f} | Fuel {fuel:5.0f} | Credits {player.get('credits', 0):8.0f} | {action}")
 
-            # Wait for game speed (match the coordinator's turn timing)
-            time.sleep(3)
+            # Match server game speed (~8s turns). 6s sleep + API round-trip ≈ 8s
+            time.sleep(6)
 
     def run(self):
         """Full lifecycle: register -> wait -> join -> play."""
