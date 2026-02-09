@@ -43,6 +43,7 @@ class StarTraderAgent:
         self.session.headers['X-Is-Agent'] = 'true'
         self.agent_name = agent_name or f"Bot-{random.randint(1000, 9999)}"
         self.agent_id = None
+        self.api_token = None
         self.match_id = None
         self.use_ai = use_ai
         self.ai_client = None
@@ -142,6 +143,12 @@ class StarTraderAgent:
             print(f"[+] Registered! Agent ID: {self.agent_id}")
             print(f"    Name: {data['agent']['name']}")
             print(f"    ELO: {data['agent']['elo_rating']}")
+            # Capture API token for Bearer auth
+            self.api_token = data.get('api_token')
+            if self.api_token:
+                self.session.headers['Authorization'] = f'Bearer {self.api_token}'
+                print(f"    API Token: {self.api_token}")
+                print(f"    (Save this! Use as Bearer token for API auth)")
             return True
         else:
             # Might already be registered with this name
@@ -239,6 +246,23 @@ class StarTraderAgent:
         else:
             print(f"[!] Join failed: {data.get('error', 'Unknown')}")
             return False
+
+    def leave_queue(self):
+        """Leave the matchmaking queue."""
+        resp = self.session.delete(f"{self.server}/api/arena/queue/leave")
+        data = self._safe_json(resp)
+        if data.get('success'):
+            print("[*] Left queue")
+        return data
+
+    def check_queue(self):
+        """Check queue status (public, no auth needed)."""
+        resp = requests.get(f"{self.server}/api/arena/queue/info")
+        data = resp.json()
+        q = data.get('queue_size', 0)
+        running = data.get('match_running', False)
+        print(f"[*] Queue: {q} waiting, match running: {running}")
+        return data
 
     # ================================================================
     # Game Actions
